@@ -105,9 +105,11 @@ tl.load use mask: i < 4 and j < 3.
 def demo2(x_ptr):
     i_range = tl.arange(0, 8)[:, None]
     j_range = tl.arange(0, 4)[None, :]
+    print("i_range:", i_range)
+    print("j_range:", j_range)
     range = i_range * 4 + j_range
     # print works in the interpreter
-    print(range)
+    print("range", range)
     x = tl.load(x_ptr + range, (i_range < 4) & (j_range < 3), 0)
     print(x)
 
@@ -182,6 +184,7 @@ use pointer (i.e. continuous in memory).
 @triton.jit
 def demo4(x_ptr):
     pid = tl.program_id(0)
+    print("pid:", pid)
     range = tl.arange(0, 8) + pid * 8
     x = tl.load(x_ptr + range, range < 20)
     print("Print for each", pid, x)
@@ -215,7 +218,8 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # We name the offsets of the pointers as "off_"
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
-    # Finish me!
+    z = x + 10.0
+    tl.store(z_ptr + off_x, z)
     return
 
 
@@ -236,7 +240,11 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
-    # Finish me!
+    idx = tl.program_id(0)
+    off_x = idx * B0 + tl.arange(0, B0)
+    x = tl.load(x_ptr + off_x, off_x < N0, 0.0)
+    z = x + 10.0
+    tl.store(z_ptr + off_x, z, off_x < N0)
     return
 
 
@@ -259,7 +267,13 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    offset_x = tl.arange(0, B0)[None, :]
+    offset_y = tl.arange(0, B1)[:, None]
+    offsets = N0 * offset_y + offset_x
+    x = tl.load(x_ptr + offset_x)
+    y = tl.load(y_ptr + offset_y)
+    z = x + y
+    tl.store(z_ptr + offsets, z)
     return
 
 
@@ -286,7 +300,14 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+    offset_x = block_id_x * B0 + tl.arange(0, B0)
+    offset_y = block_id_y * B1 + tl.arange(0, B1)
+    offset = N0 * offset_y[:, None] + offset_x[None, :]
+    x = tl.load(x_ptr + offset_x, offset_x < N0, 0.0)
+    y = tl.load(y_ptr + offset_y, offset_y < N1, 0.0)
+    z = x[None, :] + y[:, None]
+    mask = (offset_x[None, :] < N0) & (offset_y[:, None] < N1)
+    tl.store(z_ptr + offset, z, mask)
     return
 
 
@@ -313,7 +334,15 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+    offset_x = block_id_x * B0 + tl.arange(0, B0)
+    offset_y = block_id_y * B1 + tl.arange(0, B1)
+    offset = N0 * offset_y[:, None] + offset_x[None, :]
+    x = tl.load(x_ptr + offset_x, offset_x < N0, 0)
+    y = tl.load(y_ptr + offset_y, offset_y < N1, 0)
+    z = x[None, :] * y[:, None]
+    z = tl.where(z > 0, z, 0)
+    mask = (offset_x[None, :] < N0) & (offset_y[:, None] < N1)
+    tl.store(z_ptr + offset, z, mask)
     return
 
 
@@ -353,7 +382,20 @@ def mul_relu_block_back_kernel(
 ):
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
-    # Finish me!
+    offset_i = block_id_i * B0 + tl.arange(0, B0)
+    offset_j = block_id_j * B1 + tl.arange(0, B1)
+    offset_ji = N0 * offset_j[:, None] + offset_i[None, :]
+    mask_i = offset_i < N0
+    mask_j = offset_j < N1
+    mask_ji = mask_j[:, None] & mask_i[None, :]
+    x = tl.load(x_ptr + offset_ji, mask_ji, 0)
+    y = tl.load(y_ptr + offset_j, mask_j, 0)
+    dz = tl.load(dz_ptr + offset_ji, mask_ji, 0)
+    # now compute dL / dx
+    # dL / dx = dL / dz * dz / dx = dL / dz * (y if x * y > 0 else 0)
+    relu_grad = tl.where(x * y[:, None] > 0, y[:, None], 0)
+    dx = dz * relu_grad
+    tl.store(dx_ptr + offset_ji, dx, mask_ji)
     return
 
 
@@ -378,7 +420,18 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    block_id_i = tl.program_id(0)
+    offset_i = block_id_i * B0 + tl.arange(0, B0)
+    z = tl.zeros((B0,), dtype=tl.float32)
+    for id_j in range(0, T, B1):
+        offset_j = id_j + tl.arange(0, B1)
+        offset = T * offset_i[:, None] + offset_j[None, :]
+        mask_i = offset_i < N0
+        mask_j = offset_j < T
+        mask = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offset, mask, 0.0)
+        z += tl.sum(x, axis=1)
+    tl.store(z_ptr + offset_i, z, mask_i)
     return
 
 
