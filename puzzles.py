@@ -216,7 +216,7 @@ def add_spec(x: Float32[32,]) -> Float32[32,]:
 @triton.jit
 def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # We name the offsets of the pointers as "off_"
-    off_x = tl.arange(0, B0)
+    off_x = tl.arange(0, B0) + tl.program_id(0) * B0
     x = tl.load(x_ptr + off_x)
     z = x + 10.0
     tl.store(z_ptr + off_x, z)
@@ -422,14 +422,14 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     block_id_i = tl.program_id(0)
     offset_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = offset_i < N0
     z = tl.zeros((B0,), dtype=tl.float32)
-    for id_j in range(0, T, B1):
-        offset_j = id_j + tl.arange(0, B1)
-        offset = T * offset_i[:, None] + offset_j[None, :]
-        mask_i = offset_i < N0
+    for j_id in range(0, T, B1):
+        offset_j = j_id + tl.arange(0, B1)
         mask_j = offset_j < T
-        mask = mask_i[:, None] & mask_j[None, :]
-        x = tl.load(x_ptr + offset, mask, 0.0)
+        offset_ij = T * offset_i[:, None] + offset_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offset_ij, mask_ij, 0.0)
         z += tl.sum(x, axis=1)
     tl.store(z_ptr + offset_i, z, mask_i)
     return
@@ -472,7 +472,33 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     """2 loops ver."""
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
+    offset_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = offset_i < N0
+    x_max = tl.full((B0,), -float("inf"), dtype=tl.float32)
+    new_x_max = tl.full((B0,), -float("inf"), dtype=tl.float32)
+    exp_sum = tl.zeros((B0,), dtype=tl.float32)
+    # first loop to find max and exp sum
+    for j_id in range(0, T, B1):
+        offset_j = j_id + tl.arange(0, B1)
+        mask_j = offset_j < T
+        mask = mask_i[:, None] & mask_j[None, :]
+        offset_ij = T * offset_i[:, None] + offset_j[None, :]
+        x = tl.load(x_ptr + offset_ij, mask)
+        new_x_max = tl.maximum(x_max, tl.max(x, axis=1))
+        # new_exp_sum = old_exp_sum * exp(old_x_max - new_x_max) + sum(exp(x - new_x_max))
+        curr_sum = tl.sum(tl.exp2(log2_e * (x - new_x_max[:, None])), axis=1)
+        factor = tl.exp2(log2_e * (x_max - new_x_max))
+        exp_sum = exp_sum * factor + curr_sum
+        x_max = new_x_max
+    # second loop to write output
+    for j_id in range(0, T, B1):
+        offset_j = j_id + tl.arange(0, B1)
+        mask_j = offset_j < T
+        mask = mask_i[:, None] & mask_j[None, :]
+        offset_ij = T * offset_i[:, None] + offset_j[None, :]
+        x = tl.load(x_ptr + offset_ij, mask)
+        x = tl.exp2(log2_e * (x - x_max[:, None])) / exp_sum[:, None]
+        tl.store(z_ptr + offset_ij, x, mask)
     return
 
 
@@ -483,7 +509,38 @@ def softmax_kernel_brute_force(
     """3 loops ver."""
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
+    x_max = tl.full((B0,), -float("inf"), dtype=tl.float32)
+    offset_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = offset_i < N0
+    # first loop to find max
+    for j in range(0, T, B1):
+        offset_j = j + tl.arange(0, B1)
+        offset_ij = T * offset_i[:, None] + offset_j[None, :]
+        mask_j = offset_j < T
+        mask = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offset_ij, mask)
+        x_max = tl.maximum(x_max, tl.max(x, axis=1))
+    # second loop to find exp sum
+    exp_sum = tl.zeros((B0,), dtype=tl.float32)
+    for j in range(0, T, B1):
+        offset_j = j + tl.arange(0, B1)
+        offset_ij = T * offset_i[:, None] + offset_j[None, :]
+        mask_j = offset_j < T
+        mask = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offset_ij, mask)
+        # x = x - x_max[:, None]
+        x -= x_max[:, None]
+        exp_sum += tl.sum(tl.exp2(log2_e * x), axis=1)
+    # third loop to write output
+    for j in range(0, T, B1):
+        offset_j = j + tl.arange(0, B1)
+        offset_ij = T * offset_i[:, None] + offset_j[None, :]
+        mask_j = offset_j < T
+        mask = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offset_ij, mask)
+        x -= x_max[:, None]
+        x = tl.exp2(log2_e * x) / exp_sum[:, None]
+        tl.store(z_ptr + offset_ij, x, mask)
     return
 
 
@@ -521,7 +578,31 @@ def flashatt_kernel(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     myexp = lambda x: tl.exp2(log2_e * x)
-    # Finish me!
+    offset_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = offset_i < N0
+    q = tl.load(q_ptr + offset_i, mask_i, 0)
+    # cache maximum and exp sum
+    qk_max = tl.full((B0,), -float("inf"), dtype=tl.float32)
+    exp_sum = tl.zeros((B0,), dtype=tl.float32)
+    z = tl.zeros((B0,), dtype=tl.float32)
+    for j in range(0, T, B1):
+        offset_j = j + tl.arange(0, B1)
+        mask_j = offset_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        k = tl.load(k_ptr + offset_j, mask_j, 0)
+        v = tl.load(v_ptr + offset_j, mask_j, 0)
+        qk = q[:, None] * k[None, :] + tl.where(mask_ij, 0.0, -float("inf"))
+        new_qk_max = tl.maximum(qk_max, tl.max(qk, axis=1))
+        # new_exp_sum = old_exp_sum * exp(old_x_max - new_x_max) + sum(exp(x - new_x_max))
+        curr_exp = myexp(qk - new_qk_max[:, None])
+        factor = myexp(qk_max - new_qk_max)
+        exp_sum = exp_sum * factor + tl.sum(curr_exp, axis=1)
+        # compute z = z1 * factor + sum(v * exp(qk - new_qk_max))
+        z_sum = tl.sum(curr_exp * v[None, :], axis=1)
+        z = z * factor + z_sum
+        qk_max = new_qk_max
+    z = z / exp_sum
+    tl.store(z_ptr + offset_i, z, mask_i)
     return
 
 
@@ -553,8 +634,10 @@ def conv2d_spec(x: Float32[4, 8, 8], k: Float32[4, 4]) -> Float32[4, 8, 8]:
 def conv2d_kernel(
     x_ptr, k_ptr, z_ptr, N0, H, W, KH: tl.constexpr, KW: tl.constexpr, B0: tl.constexpr
 ):
+    # x: H * W
+    # k: KH * KW
     block_id_i = tl.program_id(0)
-    # Finish me!
+    offset_i = block_id_i * B0 + tl.arange(0, B0)
     return
 
 
